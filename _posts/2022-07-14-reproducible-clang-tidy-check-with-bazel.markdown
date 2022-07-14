@@ -29,9 +29,10 @@ reproducible results, we need to know which version of clang-tidy we are using
 and make sure if the version changed the Bazel would detect it.
 
 Inspired by `android_ndk_repository` rule, we wrote a `llvm_repo` repository
-rule. The `llvm_repo` requires an `attr` named `llvm_version` . This is the
-clang-tidy version we would expect. And an environment variable named
-`LLVM_HOME`, which points to the directory that contains `bin/clang-t` .
+rule in a file named `llvm.bzl`. The `llvm_repo` requires an `attr` named
+`llvm_version` . This is the clang-tidy version we would expect. And an
+environment variable named `LLVM_HOME`, which points to the directory that
+contains `bin/clang-tidy`.
 
 ```python
 _llvm_repo_attrs = {
@@ -115,7 +116,54 @@ script of runfiles library before your script. It’s omitted here.
 
 For runfiles library to find the file in an external repo, the repository name
 is needed. So we use the `ctx.file` to dynamically create the build file and the
-run_clang_tidy.sh in `llvm_repo` . 
+run_clang_tidy.sh in `llvm_repo`. We put the full `llvm.bzl` in the end.
+
+Now we can tell the bazel_clang_tidy to use the `clang-tidy` from `llvm_repo`.
+Assuming we put the `llvm.bzl` file in root directory of the repo(you can put it
+anywhere you like), we load it in `WORKSPACE` and set up `llvm_repo`.
+
+```
+load("//:llvm.bzl", "llvm_repo")
+
+llvm_repo(
+    name = "llvm",
+    llvm_version = "13.0.1",
+)
+```
+
+Then tell bazel_clang_tidy to use clang-tidy from `llvm_repo` with the
+`@bazel_clang_tidy//:clang_tidy` config flag.
+
+```bash
+build:clang-tidy --@bazel_clang_tidy//:clang_tidy=@llvm//:clang_tidy
+```
+
+If we want a hermetic check, we can package clang-tidy and upload it to a server,
+then use [`ctx.download_and_extract`](https://bazel.build/rules/lib/repository_ctx#download_and_extract)
+in `llvm_repo` implementation to download it. But so far we're happy with
+creating a symlink to a pre-installed clang-tidy.
+
+
+Another problem is that the generated result file contains the absolute paths of
+the source codes and build directories. We use a very simple way to fix this.
+Since all Bazel actions are running in execution root and it’s the execution
+root part we want to remove from the paths in result files. We simply call `pwd`
+to get the current execution root path and use `sed` to replace it to a
+reproducible value in file.
+
+We replace it with the workspace name but you can choose whatever you want.
+
+```bash
+$(rlocation "{repo_name}/llvm-{llvm_version}/bin/clang-tidy") "${{ARGS[@]}}"
+EXECUTION_ROOT="$(pwd)"
+sed -i '' "s=$EXECUTION_ROOT=$WORKSPACE_NAME=g" "$OUTPUT"
+```
+
+That’s it. The modified bazel_clang_tidy is far from perfect but works great in
+our project. The average analysis time reduced dramatically. Hope this can help
+your project too. Thanks!
+
+## llvm.bzl
 
 ```python
 BUILD_CONTENT = """
@@ -143,6 +191,7 @@ label_flag(
 )
 """
 
+
 RUNFILES_INIT = """
 # --- begin runfiles.bash initialization ---
 # Copy-pasted from Bazel's Bash runfiles library (tools/bash/runfiles/runfiles.bash).
@@ -168,6 +217,7 @@ fi
 # --- end runfiles.bash initialization ---
 """
 
+
 RUN_CLANG_TIDY_SH = """
 set -ue
 
@@ -183,7 +233,10 @@ rm -f $OUTPUT
 touch $OUTPUT
 
 $(rlocation "{repo_name}/llvm-{llvm_version}/bin/clang-tidy") "$@"
+EXECUTION_ROOT="$(pwd)"
+sed -i '' "s=$EXECUTION_ROOT=$WORKSPACE_NAME=g" "$OUTPUT"
 """
+
 
 DOT_CLANG_TIDY = """
 UseColor: true
@@ -197,6 +250,7 @@ HeaderFilterRegex: ".*"
 
 WarningsAsErrors: "*"
 """
+
 
 def _llvm_repo_impl(ctx):
     """Implementation of the llvm_repo rule."""
@@ -216,29 +270,17 @@ def _llvm_repo_impl(ctx):
              executable=True)
     ctx.file(".clang-tidy", DOT_CLANG_TIDY, executable=False)
     ctx.symlink(llvm_home, "llvm-"+llvm_version)
+
+
+_llvm_repo_attrs = {
+    "llvm_version": attr.string(doc='LLVM version', mandatory=True)
+}
+
+
+llvm_repo = repository_rule(
+    implementation = _llvm_repo_impl,
+    attrs = _llvm_repo_attrs,
+    doc = "Setup llvm repo.",
+    environ = ["LLVM_HOME"],
+)
 ```
-
-Finally, we tell the `clang_tidy_aspect` to use the `clang-tidy` from `llvm_repo` in `.bazelrc`.
-
-```bash
-build:clang-tidy --@bazel_clang_tidy//:clang_tidy=@llvm//:clang_tidy
-```
-
-Another problem is that the generated result file contains the absolute path of
-the source code and build directory. We use a very simple way to fix this.
-Since all Bazel actions are running in execution root and it’s the execution
-root part we want to remove from the paths in result files. We simply call `pwd`
-to get the current execution root path and use `sed` to replace it to a
-reproducible value in file.
-
-We replace it with the workspace name but you can choose whatever you want.
-
-```bash
-$(rlocation "{repo_name}/llvm-{llvm_version}/bin/clang-tidy") "${{ARGS[@]}}"
-EXECUTION_ROOT="$(pwd)"
-sed -i '' "s=$EXECUTION_ROOT=$WORKSPACE_NAME=g" "$OUTPUT"
-```
-
-That’s it. The modified bazel_clang_tidy is far from perfect but works great in
-our project. The average analysis time reduced dramatically. Hope this can help
-your project too. Thanks!
